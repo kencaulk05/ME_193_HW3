@@ -1,0 +1,5 @@
+legoeducation==1.1.1
+paho-mqtt
+pyaudio
+numpy
+matplotlib
