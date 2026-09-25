@@ -43,7 +43,26 @@ CHUNK = 1024            # samples read from the mic per read() call
 WINDOW_SIZE = 4096       # samples analyzed per FFT (several chunks' worth,
                          # for better frequency resolution than one CHUNK alone)
 
-PLOT_MAX_FREQ = 5000    # spectrum plot x-axis limit
+PLOT_MAX_FREQ = 5000    # spectrum/spectrogram frequency-axis limit
+
+# --- Spectrogram history ---
+# How much scrolling time history the spectrogram shows at once. Each
+# column is one audio-thread iteration (one CHUNK read, ~CHUNK/SAMPLE_RATE
+# seconds), so this many seconds of columns are kept and scrolled left as
+# new ones arrive on the right.
+SPEC_HISTORY_SECONDS = 8
+
+# Loudness range (dB) mapped to the spectrogram's colormap. Tune these if
+# the display looks all-dark (raise SPEC_DB_FLOOR toward SPEC_DB_CEILING)
+# or all-bright (lower SPEC_DB_CEILING) for your mic's actual gain.
+SPEC_DB_FLOOR = -40.0
+SPEC_DB_CEILING = 40.0
+
+# Precomputed once: which FFT bins fall within the displayed frequency
+# range, since WINDOW_SIZE/SAMPLE_RATE never change at runtime.
+_ALL_FREQS = np.fft.rfftfreq(WINDOW_SIZE, d=1 / SAMPLE_RATE)
+_DISPLAY_BIN_COUNT = int(np.searchsorted(_ALL_FREQS, PLOT_MAX_FREQ))
+_SPEC_HISTORY_COLUMNS = max(1, int(SPEC_HISTORY_SECONDS / (CHUNK / SAMPLE_RATE)))
 
 # ---------------------------------------------------------------------------
 # Noise masking -- how we tell "a whistle" apart from silence/background noise
@@ -130,6 +149,7 @@ state = {
     "whistle_detected": False,
     "raw_command": None,       # this frame's classification, or None
     "effective_command": cfg.CMD_STOP,  # what we've actually published
+    "spec_history": np.full((_DISPLAY_BIN_COUNT, _SPEC_HISTORY_COLUMNS), SPEC_DB_FLOOR, dtype=np.float32),
 }
 running = True
 
@@ -170,6 +190,7 @@ def audio_thread_fn(device_index, mqtt_client):
     stable_command = None
     last_whistle_time = time.monotonic()
     last_published = None
+    spec_history = state["spec_history"].copy()
 
     print("Listening... whistle to drive. Ctrl+C or close the plot window to quit.")
 
@@ -208,6 +229,13 @@ def audio_thread_fn(device_index, mqtt_client):
                       f"(peak={peak_freq:.0f}Hz purity={purity:.2f} rms={rms:.3f})")
                 last_published = effective_command
 
+            # Scroll this frame's magnitude spectrum (cropped to the display
+            # range, converted to dB) into the spectrogram history as the
+            # newest column.
+            column_db = 20.0 * np.log10(magnitude[:_DISPLAY_BIN_COUNT] + 1e-9)
+            spec_history = np.roll(spec_history, -1, axis=1)
+            spec_history[:, -1] = column_db
+
             with lock:
                 state["waveform"] = rolling.copy()
                 state["freqs"] = freqs
@@ -217,6 +245,7 @@ def audio_thread_fn(device_index, mqtt_client):
                 state["purity"] = purity
                 state["whistle_detected"] = is_whistle
                 state["raw_command"] = raw_command
+                state["spec_history"] = spec_history
                 state["effective_command"] = effective_command
     finally:
         stream.stop_stream()
@@ -228,41 +257,73 @@ def audio_thread_fn(device_index, mqtt_client):
 # Live plot
 # ---------------------------------------------------------------------------
 
-def build_plot():
-    fig, (ax_wave, ax_spec) = plt.subplots(2, 1, figsize=(10, 7))
-    fig.subplots_adjust(hspace=0.4)
+plt.style.use("dark_background")
 
+# Shared by both the spectrogram (horizontal bands) and the spectrum panel
+# (vertical bands) -- one definition, so the two views can never disagree
+# about which frequency does what.
+BAND_EDGES = [0, BAND_STOP_MAX, BAND_LEFT_MAX, BAND_RIGHT_MAX, BAND_FORWARD_MAX, PLOT_MAX_FREQ]
+BAND_LABELS = [cfg.CMD_STOP, cfg.CMD_LEFT, cfg.CMD_RIGHT, cfg.CMD_FORWARD, cfg.CMD_GOAL]
+
+
+def build_plot():
+    fig, (ax_wave, ax_specgram, ax_spec) = plt.subplots(
+        3, 1, figsize=(10, 10), gridspec_kw={"height_ratios": [1, 2.2, 1.3]}
+    )
+    fig.suptitle("Whistle Drive -- Live Audio Monitor", fontsize=14, fontweight="bold")
+    fig.subplots_adjust(hspace=0.55, top=0.90, left=0.09, right=0.97, bottom=0.06)
+
+    # --- Waveform ---
     t = np.arange(WINDOW_SIZE) / SAMPLE_RATE
-    wave_line, = ax_wave.plot(t, np.zeros(WINDOW_SIZE), linewidth=0.7)
+    wave_line, = ax_wave.plot(t, np.zeros(WINDOW_SIZE), linewidth=0.7, color="#22d3ee")
     ax_wave.set_ylim(-1, 1)
     ax_wave.set_xlim(0, WINDOW_SIZE / SAMPLE_RATE)
     ax_wave.set_xlabel("Time (s)")
     ax_wave.set_ylabel("Amplitude")
     ax_wave.set_title("Live waveform")
-    ax_wave.grid(alpha=0.3)
+    ax_wave.grid(alpha=0.2)
 
-    spec_line, = ax_spec.plot([], [], linewidth=0.8, color="black")
-    peak_marker = ax_spec.axvline(0, color="red", linestyle="--", linewidth=1.5)
+    # --- Spectrogram: scrolling time/frequency/loudness history ---
+    specgram_im = ax_specgram.imshow(
+        state["spec_history"],
+        aspect="auto", origin="lower", cmap="inferno",
+        extent=[-SPEC_HISTORY_SECONDS, 0, 0, PLOT_MAX_FREQ],
+        vmin=SPEC_DB_FLOOR, vmax=SPEC_DB_CEILING, interpolation="nearest",
+    )
+    ax_specgram.set_xlabel("Time (s ago)")
+    ax_specgram.set_ylabel("Frequency (Hz)")
+    ax_specgram.set_title("Live spectrogram")
+    fig.colorbar(specgram_im, ax=ax_specgram, pad=0.01, label="Magnitude (dB)")
+
+    # Label each frequency band with the command it drives, right on the
+    # spectrogram -- so "what would the car do at this frequency" is
+    # answered directly on the history you're watching, not just the
+    # current-instant panel below.
+    for lo, hi, label in zip(BAND_EDGES[:-1], BAND_EDGES[1:], BAND_LABELS):
+        ax_specgram.axhspan(lo, hi, color=BAND_COLORS[label], alpha=0.18)
+        ax_specgram.text(-SPEC_HISTORY_SECONDS + 0.15, (lo + hi) / 2, label,
+                          color=BAND_COLORS[label], fontsize=9, fontweight="bold",
+                          ha="left", va="center")
+
+    # --- Current-instant spectrum + decision ---
+    spec_line, = ax_spec.plot([], [], linewidth=0.9, color="#e5e5e5")
+    peak_marker = ax_spec.axvline(0, color="#ef4444", linestyle="--", linewidth=1.5)
     ax_spec.set_xlim(0, PLOT_MAX_FREQ)
     ax_spec.set_xlabel("Frequency (Hz)")
     ax_spec.set_ylabel("Magnitude")
     ax_spec.set_title("Live spectrum + decision")
 
-    # Shade each pitch band with the color it maps to, so you can see at a
-    # glance which band the peak (red dashed line) is sitting in.
-    band_edges = [0, BAND_STOP_MAX, BAND_LEFT_MAX, BAND_RIGHT_MAX, BAND_FORWARD_MAX, PLOT_MAX_FREQ]
-    band_labels = [cfg.CMD_STOP, cfg.CMD_LEFT, cfg.CMD_RIGHT, cfg.CMD_FORWARD, cfg.CMD_GOAL]
-    for lo, hi, label in zip(band_edges[:-1], band_edges[1:], band_labels):
+    for lo, hi, label in zip(BAND_EDGES[:-1], BAND_EDGES[1:], BAND_LABELS):
         ax_spec.axvspan(lo, hi, color=BAND_COLORS[label], alpha=0.12)
-        ax_spec.text((lo + hi) / 2, 0, label, ha="center", va="bottom",
-                    fontsize=8, alpha=0.6, rotation=90)
+        ax_spec.text((lo + hi) / 2, 0, label, color=BAND_COLORS[label],
+                     ha="center", va="bottom", fontsize=8, fontweight="bold", rotation=90)
 
-    status_text = fig.text(0.02, 0.96, "", fontsize=12, family="monospace", va="top")
+    status_text = fig.text(0.02, 0.965, "", fontsize=12, family="monospace", va="top")
 
-    return fig, wave_line, spec_line, peak_marker, status_text
+    return fig, wave_line, specgram_im, spec_line, peak_marker, status_text
 
 
-def update_plot(_frame, wave_line, spec_line, peak_marker, status_text):
+def update_plot(_frame, wave_line, specgram_im, spec_line, peak_marker, status_text):
     with lock:
         waveform = state["waveform"]
         freqs = state["freqs"]
@@ -272,8 +333,11 @@ def update_plot(_frame, wave_line, spec_line, peak_marker, status_text):
         purity = state["purity"]
         whistle_detected = state["whistle_detected"]
         effective_command = state["effective_command"]
+        spec_history = state["spec_history"]
 
     wave_line.set_ydata(waveform)
+
+    specgram_im.set_data(spec_history)
 
     mask = freqs <= PLOT_MAX_FREQ
     spec_line.set_data(freqs[mask], magnitude[mask])
@@ -282,7 +346,7 @@ def update_plot(_frame, wave_line, spec_line, peak_marker, status_text):
 
     peak_marker.set_xdata([peak_freq, peak_freq])
 
-    color = BAND_COLORS.get(effective_command, "#000000")
+    color = BAND_COLORS.get(effective_command, "#ffffff")
     status_text.set_color(color)
     status_text.set_text(
         f"command: {effective_command:<8}  "
@@ -290,7 +354,7 @@ def update_plot(_frame, wave_line, spec_line, peak_marker, status_text):
         f"peak={peak_freq:6.0f} Hz   purity={purity:4.2f}   rms={rms:5.3f}"
     )
 
-    return wave_line, spec_line, peak_marker, status_text
+    return wave_line, specgram_im, spec_line, peak_marker, status_text
 
 
 # ---------------------------------------------------------------------------
@@ -329,8 +393,9 @@ def main():
     audio_thread = threading.Thread(target=audio_thread_fn, args=(args.device, mqtt_client), daemon=True)
     audio_thread.start()
 
-    fig, wave_line, spec_line, peak_marker, status_text = build_plot()
-    ani = FuncAnimation(fig, update_plot, fargs=(wave_line, spec_line, peak_marker, status_text),
+    fig, wave_line, specgram_im, spec_line, peak_marker, status_text = build_plot()
+    ani = FuncAnimation(fig, update_plot,
+                        fargs=(wave_line, specgram_im, spec_line, peak_marker, status_text),
                         interval=80, cache_frame_data=False)
 
     def on_close(_event):
