@@ -36,9 +36,18 @@ from lelib import doubleMotor
 import config as cfg
 from mqttlib import MQTTClient
 from whistle_detector import WhistleDetector
+from whistle_display import WhistleMonitor
 
 SAMPLE_RATE = 44100
 CHUNK = 1024
+
+# Accepted whistle frequency range for THIS computer only. Kept wide for
+# now (covers essentially all normal whistling); narrow this once you want
+# this computer to only respond to a specific pitch register. This is
+# intentionally independent from remote_computer.py's own
+# ANALYSIS_MIN_FREQ/MAX_FREQ -- the two can be tuned to different ranges.
+ANALYSIS_MIN_FREQ = 300
+ANALYSIS_MAX_FREQ = 5000
 
 DRIVE_SPEED = 50    # forward speed, 0-100, applied to both wheels
 TURN_BIAS = 30      # added to the left wheel / subtracted from the right
@@ -181,43 +190,60 @@ def main():
     mqtt_client.subscribe(cfg.TURN_TOPIC, on_turn_message)
     print(f"[main] Listening for remote turn signal on '{cfg.TURN_TOPIC}'")
 
-    detector = WhistleDetector()
+    detector = WhistleDetector(analysis_min_freq=ANALYSIS_MIN_FREQ, analysis_max_freq=ANALYSIS_MAX_FREQ)
+    monitor = WhistleMonitor(title="Main Computer - Whistle Monitor",
+                              analysis_min_freq=ANALYSIS_MIN_FREQ,
+                              analysis_max_freq=ANALYSIS_MAX_FREQ,
+                              chunk_size=CHUNK)
 
-    p = pyaudio.PyAudio()
-    stream = p.open(format=pyaudio.paFloat32, channels=1, rate=SAMPLE_RATE,
-                     input=True, input_device_index=args.device, frames_per_buffer=CHUNK)
+    def audio_loop():
+        last_left, last_right = None, None
+        p = pyaudio.PyAudio()
+        stream = p.open(format=pyaudio.paFloat32, channels=1, rate=SAMPLE_RATE,
+                         input=True, input_device_index=args.device, frames_per_buffer=CHUNK)
 
-    last_left, last_right = None, None
-    print("Whistle to drive forward. Remote whistle adds a clockwise turn. Ctrl+C to quit.")
+        print("Whistle to drive forward. Remote whistle adds a clockwise turn. "
+              "Close the window (or Ctrl+C) to quit.")
+        try:
+            while monitor.running:
+                data = stream.read(CHUNK, exception_on_overflow=False)
+                chunk = np.frombuffer(data, dtype=np.float32)
+
+                local_forward, freq = detector.update(chunk)
+
+                with lock:
+                    turning = remote_turning
+                    stale = (last_remote_message_time == 0.0
+                              or time.monotonic() - last_remote_message_time > REMOTE_SIGNAL_TIMEOUT)
+                if stale:
+                    turning = False
+
+                left, right = mix(local_forward, turning)
+                status_label = (f"{'FORWARD' if local_forward else 'STOP'}/"
+                                 f"{'TURN' if turning else 'straight'}")
+                monitor.push(detector, status_label=status_label,
+                             status_color="#22c55e" if local_forward else "#888888")
+
+                if (left, right) != (last_left, last_right):
+                    print(f"[main] local={'FORWARD' if local_forward else 'STOP':7s}  "
+                          f"remote={'TURNING' if turning else 'not turning':11s}  "
+                          f"-> L={left:+.0f} R={right:+.0f}")
+                    car.drive(left, right)
+                    last_left, last_right = left, right
+        finally:
+            car.stop()
+            stream.stop_stream()
+            stream.close()
+            p.terminate()
+
+    audio_thread = threading.Thread(target=audio_loop, daemon=True)
+    audio_thread.start()
 
     try:
-        while True:
-            data = stream.read(CHUNK, exception_on_overflow=False)
-            chunk = np.frombuffer(data, dtype=np.float32)
-
-            local_forward, freq = detector.update(chunk)
-
-            with lock:
-                turning = remote_turning
-                stale = (last_remote_message_time == 0.0
-                          or time.monotonic() - last_remote_message_time > REMOTE_SIGNAL_TIMEOUT)
-            if stale:
-                turning = False
-
-            left, right = mix(local_forward, turning)
-            if (left, right) != (last_left, last_right):
-                print(f"[main] local={'FORWARD' if local_forward else 'STOP':7s}  "
-                      f"remote={'TURNING' if turning else 'not turning':11s}  "
-                      f"-> L={left:+.0f} R={right:+.0f}")
-                car.drive(left, right)
-                last_left, last_right = left, right
-    except KeyboardInterrupt:
-        pass
+        monitor.run()  # blocks on the main thread until the window is closed
     finally:
-        car.stop()
-        stream.stop_stream()
-        stream.close()
-        p.terminate()
+        monitor.running = False
+        audio_thread.join(timeout=3)
         car.disconnect()
         mqtt_client.disconnect()
 

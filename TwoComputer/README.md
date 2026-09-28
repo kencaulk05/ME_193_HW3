@@ -23,7 +23,10 @@ The two signals are **blended**, not exclusive:
 Both scripts share the exact same tuned whistle-detection logic (adaptive
 noise floor, hysteresis, spectral purity gate, frequency smoothing) via
 `whistle_detector.py`, factored out of the ME_193_HW3 project so neither
-script has to duplicate that ~150 lines of noise-masking logic.
+script has to duplicate that ~150 lines of noise-masking logic. Both also
+show a live waveform + spectrogram + spectrum monitor (`whistle_display.py`)
+with the accepted frequency range shaded in green, so you can see what
+each mic is picking up and whether it falls inside that range.
 
 ## Setup (on both computers)
 
@@ -77,16 +80,28 @@ confirmed, and `main_computer.py` treats a missing/stale remote signal as
 "not turning" (see `REMOTE_SIGNAL_TIMEOUT`) rather than getting stuck
 mid-turn if the remote computer isn't running yet or drops out.
 
+Each script opens its own live monitor window; close that window (or
+Ctrl+C) to quit -- the mic-reading loop runs on a background thread, so
+closing the window is what actually stops everything cleanly (motors
+stopped, MQTT disconnected).
+
 ## Tuning
 
+- `ANALYSIS_MIN_FREQ` / `ANALYSIS_MAX_FREQ` -- set **independently** at the
+  top of `main_computer.py` and `remote_computer.py`. Kept wide (300-5000
+  Hz) for now so almost any whistle registers; narrow each one down
+  separately once you want, say, the main computer to only respond to a
+  higher-pitched whistle than the remote one (helps tell the two mics'
+  input apart if they're ever in earshot of each other). The accepted
+  range is shaded green on that script's own monitor window.
 - `DRIVE_SPEED`, `TURN_BIAS` in `main_computer.py` -- forward speed and how
   much the turn signal biases the two wheels apart. Bigger `TURN_BIAS` =
   tighter/faster turn.
 - `REMOTE_SIGNAL_TIMEOUT` -- how long without a message before the remote
   side is treated as stale/not-turning.
-- Whistle detection constants (noise floor, hysteresis, purity threshold,
-  frequency bands) live in `whistle_detector.py` -- see ME_193_HW3's
-  README for the full explanation of what each one does and why.
+- Other whistle detection constants (noise floor, hysteresis, purity
+  threshold) live in `whistle_detector.py` -- see ME_193_HW3's README for
+  the full explanation of what each one does and why.
 - `INVERT_LEFT_MOTOR` / `INVERT_RIGHT_MOTOR` in `main_computer.py` --
   flip whichever side turns out backwards once you test on real hardware
   (the two motors are usually mounted mirrored on the chassis).
