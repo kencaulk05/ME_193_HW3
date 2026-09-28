@@ -7,17 +7,30 @@ execute on the actual robot. This script never touches the hub directly --
 see the README for why (BLE only allows one connection to a hub at a time,
 so only game_logic.py owns that connection).
 
-Shows a live two-panel plot: the raw waveform on top, the frequency
-spectrum (with the pitch bands shaded and the detected peak marked) on the
-bottom, plus a text readout of the live decision.
+Two people, two channels: everyone's natural whistle range is different,
+so rather than one shared 5-band scheme (which broke when one person's
+whistle simply couldn't reach another person's assigned band), each person
+runs this with their OWN --channel, each with its own independently
+tunable band thresholds and its own MQTT topic:
+
+    --channel steer     2-3 bands: LEFT / STRAIGHT / RIGHT
+    --channel throttle   2-3 bands: STOP / FORWARD / GOAL (special)
+
+game_logic.py subscribes to both topics and continuously mixes the two
+most recent commands together into actual wheel speeds.
+
+Shows a live plot: the raw waveform, a scrolling spectrogram, and the
+current spectrum with THIS CHANNEL's bands shaded and the detected peak
+marked, plus a text readout of the live decision.
 
 Install first:
     pip install pyaudio numpy matplotlib
 
 Usage:
-    python whistle_drive.py
-    python whistle_drive.py --list-devices     # find your mic's device index
-    python whistle_drive.py --device 2
+    python whistle_drive.py --channel steer
+    python whistle_drive.py --channel throttle
+    python whistle_drive.py --channel steer --list-devices   # find your mic's device index
+    python whistle_drive.py --channel steer --device 2
 Close the plot window to quit.
 """
 
@@ -43,7 +56,26 @@ CHUNK = 1024            # samples read from the mic per read() call
 WINDOW_SIZE = 4096       # samples analyzed per FFT (several chunks' worth,
                          # for better frequency resolution than one CHUNK alone)
 
-PLOT_MAX_FREQ = 5000    # spectrum plot x-axis limit
+PLOT_MAX_FREQ = 5000    # spectrum/spectrogram frequency-axis limit
+
+# --- Spectrogram history ---
+# How much scrolling time history the spectrogram shows at once. Each
+# column is one audio-thread iteration (one CHUNK read, ~CHUNK/SAMPLE_RATE
+# seconds), so this many seconds of columns are kept and scrolled left as
+# new ones arrive on the right.
+SPEC_HISTORY_SECONDS = 8
+
+# Loudness range (dB) mapped to the spectrogram's colormap. Tune these if
+# the display looks all-dark (raise SPEC_DB_FLOOR toward SPEC_DB_CEILING)
+# or all-bright (lower SPEC_DB_CEILING) for your mic's actual gain.
+SPEC_DB_FLOOR = -40.0
+SPEC_DB_CEILING = 40.0
+
+# Precomputed once: which FFT bins fall within the displayed frequency
+# range, since WINDOW_SIZE/SAMPLE_RATE never change at runtime.
+_ALL_FREQS = np.fft.rfftfreq(WINDOW_SIZE, d=1 / SAMPLE_RATE)
+_DISPLAY_BIN_COUNT = int(np.searchsorted(_ALL_FREQS, PLOT_MAX_FREQ))
+_SPEC_HISTORY_COLUMNS = max(1, int(SPEC_HISTORY_SECONDS / (CHUNK / SAMPLE_RATE)))
 
 # ---------------------------------------------------------------------------
 # Noise masking -- how we tell "a whistle" apart from silence/background noise
@@ -70,42 +102,73 @@ PURITY_THRESHOLD = 0.35
 PURITY_BAND_HZ = 60  # width around the peak counted as "the peak's energy"
 
 # ---------------------------------------------------------------------------
-# Pitch bands -> driving commands
+# Pitch bands -> commands, one independent scheme per channel
 # ---------------------------------------------------------------------------
-# CALIBRATE THESE against your own whistle range: run
+# CALIBRATE THESE against YOUR OWN whistle range: run
 #   python whistle_recorder.py
 # a few times, whistle low/medium/high/very-high, and read off the printed
-# "Dominant frequency" each time. Typical whistling covers roughly 500-4000
-# Hz, but everyone's range differs -- these are starting points, not truth.
+# "Dominant frequency" each time. Whoever is running --channel steer only
+# needs to reliably hit two or three of their own comfortable pitches; same
+# for --channel throttle. The two people's thresholds don't need to relate
+# to each other at all -- that's the whole point of splitting the channels.
 
-BAND_STOP_MAX = 700       # freq below this -> stop
-BAND_LEFT_MAX = 1300      # freq below this (and above BAND_STOP_MAX) -> turn left
-BAND_RIGHT_MAX = 2000     # freq below this (and above BAND_LEFT_MAX) -> turn right
-BAND_FORWARD_MAX = 3200   # freq below this (and above BAND_RIGHT_MAX) -> speed up / forward
-# freq above BAND_FORWARD_MAX -> CMD_GOAL (the special "I scored" whistle) --
-# deliberately a hard-to-hit-by-accident range at the very top of most
-# people's whistling register.
+# --- steer channel: LEFT / STRAIGHT (neutral) / RIGHT ---
+STEER_LEFT_MAX = 900        # freq below this -> LEFT
+STEER_STRAIGHT_MAX = 1500   # freq below this (and above STEER_LEFT_MAX) -> STRAIGHT
+# freq above STEER_STRAIGHT_MAX -> RIGHT
 
-BAND_COLORS = {
-    cfg.CMD_STOP: "#888888",
-    cfg.CMD_LEFT: "#3b82f6",
-    cfg.CMD_RIGHT: "#f59e0b",
-    cfg.CMD_FORWARD: "#22c55e",
-    cfg.CMD_GOAL: "#ef4444",
-}
+# --- throttle channel: STOP / FORWARD / GOAL (special) ---
+THROTTLE_STOP_MAX = 900     # freq below this -> STOP
+THROTTLE_GOAL_MIN = 3200    # freq above this -> GOAL (special "I scored" whistle --
+                            # deliberately a hard-to-hit-by-accident range at
+                            # the very top of the throttle-whistler's register)
+# freq between THROTTLE_STOP_MAX and THROTTLE_GOAL_MIN -> FORWARD
 
 
-def classify_frequency(freq_hz):
-    if freq_hz < BAND_STOP_MAX:
-        return cfg.CMD_STOP
-    elif freq_hz < BAND_LEFT_MAX:
+def classify_steer(freq_hz):
+    if freq_hz < STEER_LEFT_MAX:
         return cfg.CMD_LEFT
-    elif freq_hz < BAND_RIGHT_MAX:
+    elif freq_hz < STEER_STRAIGHT_MAX:
+        return cfg.CMD_STRAIGHT
+    else:
         return cfg.CMD_RIGHT
-    elif freq_hz < BAND_FORWARD_MAX:
+
+
+def classify_throttle(freq_hz):
+    if freq_hz < THROTTLE_STOP_MAX:
+        return cfg.CMD_STOP
+    elif freq_hz < THROTTLE_GOAL_MIN:
         return cfg.CMD_FORWARD
     else:
         return cfg.CMD_GOAL
+
+
+CHANNELS = {
+    "steer": {
+        "topic": cfg.STEER_TOPIC,
+        "classify": classify_steer,
+        "band_edges": [0, STEER_LEFT_MAX, STEER_STRAIGHT_MAX, PLOT_MAX_FREQ],
+        "band_labels": [cfg.CMD_LEFT, cfg.CMD_STRAIGHT, cfg.CMD_RIGHT],
+        "default_command": cfg.CMD_STRAIGHT,
+        "colors": {
+            cfg.CMD_LEFT: "#3b82f6",
+            cfg.CMD_STRAIGHT: "#888888",
+            cfg.CMD_RIGHT: "#f59e0b",
+        },
+    },
+    "throttle": {
+        "topic": cfg.THROTTLE_TOPIC,
+        "classify": classify_throttle,
+        "band_edges": [0, THROTTLE_STOP_MAX, THROTTLE_GOAL_MIN, PLOT_MAX_FREQ],
+        "band_labels": [cfg.CMD_STOP, cfg.CMD_FORWARD, cfg.CMD_GOAL],
+        "default_command": cfg.CMD_STOP,
+        "colors": {
+            cfg.CMD_STOP: "#888888",
+            cfg.CMD_FORWARD: "#22c55e",
+            cfg.CMD_GOAL: "#ef4444",
+        },
+    },
+}
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +193,7 @@ state = {
     "whistle_detected": False,
     "raw_command": None,       # this frame's classification, or None
     "effective_command": cfg.CMD_STOP,  # what we've actually published
+    "spec_history": np.full((_DISPLAY_BIN_COUNT, _SPEC_HISTORY_COLUMNS), SPEC_DB_FLOOR, dtype=np.float32),
 }
 running = True
 
@@ -159,7 +223,11 @@ def analyze_buffer(buffer):
     return rms, freqs, magnitude, peak_freq, purity
 
 
-def audio_thread_fn(device_index, mqtt_client):
+def audio_thread_fn(device_index, mqtt_client, channel):
+    classify = channel["classify"]
+    topic = channel["topic"]
+    default_command = channel["default_command"]
+
     p = pyaudio.PyAudio()
     stream = p.open(format=pyaudio.paFloat32, channels=1, rate=SAMPLE_RATE,
                     input=True, input_device_index=device_index,
@@ -170,6 +238,7 @@ def audio_thread_fn(device_index, mqtt_client):
     stable_command = None
     last_whistle_time = time.monotonic()
     last_published = None
+    spec_history = state["spec_history"].copy()
 
     print("Listening... whistle to drive. Ctrl+C or close the plot window to quit.")
 
@@ -183,7 +252,7 @@ def audio_thread_fn(device_index, mqtt_client):
 
             rms, freqs, magnitude, peak_freq, purity = analyze_buffer(rolling)
             is_whistle = (rms >= SILENCE_RMS) and (purity >= PURITY_THRESHOLD)
-            raw_command = classify_frequency(peak_freq) if is_whistle else None
+            raw_command = classify(peak_freq) if is_whistle else None
 
             now = time.monotonic()
             if is_whistle:
@@ -195,18 +264,29 @@ def audio_thread_fn(device_index, mqtt_client):
                     and raw_command is not None):
                 stable_command = raw_command
 
-            # Fail-safe: force STOP if nothing valid has been heard recently
-            # -- see the README's answer to "what if no whistle is detected?"
+            # Fail-safe: revert to this channel's neutral default if nothing
+            # valid has been heard recently -- see the README's answer to
+            # "what if no whistle is detected?" Note the default differs by
+            # channel: throttle fails safe to STOP (stop moving), steer
+            # fails safe to STRAIGHT (stop turning, but don't fight
+            # whatever the throttle channel is doing).
             if now - last_whistle_time > NO_WHISTLE_TIMEOUT:
-                effective_command = cfg.CMD_STOP
+                effective_command = default_command
             else:
-                effective_command = stable_command or cfg.CMD_STOP
+                effective_command = stable_command or default_command
 
             if effective_command != last_published:
-                mqtt_client.publish(cfg.DRIVE_TOPIC, effective_command)
+                mqtt_client.publish(topic, effective_command)
                 print(f"[whistle] -> {effective_command}  "
                       f"(peak={peak_freq:.0f}Hz purity={purity:.2f} rms={rms:.3f})")
                 last_published = effective_command
+
+            # Scroll this frame's magnitude spectrum (cropped to the display
+            # range, converted to dB) into the spectrogram history as the
+            # newest column.
+            column_db = 20.0 * np.log10(magnitude[:_DISPLAY_BIN_COUNT] + 1e-9)
+            spec_history = np.roll(spec_history, -1, axis=1)
+            spec_history[:, -1] = column_db
 
             with lock:
                 state["waveform"] = rolling.copy()
@@ -217,6 +297,7 @@ def audio_thread_fn(device_index, mqtt_client):
                 state["purity"] = purity
                 state["whistle_detected"] = is_whistle
                 state["raw_command"] = raw_command
+                state["spec_history"] = spec_history
                 state["effective_command"] = effective_command
     finally:
         stream.stop_stream()
@@ -228,41 +309,75 @@ def audio_thread_fn(device_index, mqtt_client):
 # Live plot
 # ---------------------------------------------------------------------------
 
-def build_plot():
-    fig, (ax_wave, ax_spec) = plt.subplots(2, 1, figsize=(10, 7))
-    fig.subplots_adjust(hspace=0.4)
+plt.style.use("dark_background")
 
+# The selected channel's band edges/labels/colors, used by both the
+# spectrogram (horizontal bands) and the spectrum panel (vertical bands) --
+# one definition, so the two views can never disagree about which
+# frequency does what. Set by main() before build_plot() is called.
+BAND_EDGES = None
+BAND_LABELS = None
+BAND_COLORS = None
+
+
+def build_plot(channel_name):
+    fig, (ax_wave, ax_specgram, ax_spec) = plt.subplots(
+        3, 1, figsize=(10, 10), gridspec_kw={"height_ratios": [1, 2.2, 1.3]}
+    )
+    fig.suptitle(f"Whistle Drive -- {channel_name.upper()} channel", fontsize=14, fontweight="bold")
+    fig.subplots_adjust(hspace=0.55, top=0.90, left=0.09, right=0.97, bottom=0.06)
+
+    # --- Waveform ---
     t = np.arange(WINDOW_SIZE) / SAMPLE_RATE
-    wave_line, = ax_wave.plot(t, np.zeros(WINDOW_SIZE), linewidth=0.7)
+    wave_line, = ax_wave.plot(t, np.zeros(WINDOW_SIZE), linewidth=0.7, color="#22d3ee")
     ax_wave.set_ylim(-1, 1)
     ax_wave.set_xlim(0, WINDOW_SIZE / SAMPLE_RATE)
     ax_wave.set_xlabel("Time (s)")
     ax_wave.set_ylabel("Amplitude")
     ax_wave.set_title("Live waveform")
-    ax_wave.grid(alpha=0.3)
+    ax_wave.grid(alpha=0.2)
 
-    spec_line, = ax_spec.plot([], [], linewidth=0.8, color="black")
-    peak_marker = ax_spec.axvline(0, color="red", linestyle="--", linewidth=1.5)
+    # --- Spectrogram: scrolling time/frequency/loudness history ---
+    specgram_im = ax_specgram.imshow(
+        state["spec_history"],
+        aspect="auto", origin="lower", cmap="inferno",
+        extent=[-SPEC_HISTORY_SECONDS, 0, 0, PLOT_MAX_FREQ],
+        vmin=SPEC_DB_FLOOR, vmax=SPEC_DB_CEILING, interpolation="nearest",
+    )
+    ax_specgram.set_xlabel("Time (s ago)")
+    ax_specgram.set_ylabel("Frequency (Hz)")
+    ax_specgram.set_title("Live spectrogram")
+    fig.colorbar(specgram_im, ax=ax_specgram, pad=0.01, label="Magnitude (dB)")
+
+    # Label each frequency band with the command it drives, right on the
+    # spectrogram -- so "what would the car do at this frequency" is
+    # answered directly on the history you're watching, not just the
+    # current-instant panel below.
+    for lo, hi, label in zip(BAND_EDGES[:-1], BAND_EDGES[1:], BAND_LABELS):
+        ax_specgram.axhspan(lo, hi, color=BAND_COLORS[label], alpha=0.18)
+        ax_specgram.text(-SPEC_HISTORY_SECONDS + 0.15, (lo + hi) / 2, label,
+                          color=BAND_COLORS[label], fontsize=9, fontweight="bold",
+                          ha="left", va="center")
+
+    # --- Current-instant spectrum + decision ---
+    spec_line, = ax_spec.plot([], [], linewidth=0.9, color="#e5e5e5")
+    peak_marker = ax_spec.axvline(0, color="#ef4444", linestyle="--", linewidth=1.5)
     ax_spec.set_xlim(0, PLOT_MAX_FREQ)
     ax_spec.set_xlabel("Frequency (Hz)")
     ax_spec.set_ylabel("Magnitude")
     ax_spec.set_title("Live spectrum + decision")
 
-    # Shade each pitch band with the color it maps to, so you can see at a
-    # glance which band the peak (red dashed line) is sitting in.
-    band_edges = [0, BAND_STOP_MAX, BAND_LEFT_MAX, BAND_RIGHT_MAX, BAND_FORWARD_MAX, PLOT_MAX_FREQ]
-    band_labels = [cfg.CMD_STOP, cfg.CMD_LEFT, cfg.CMD_RIGHT, cfg.CMD_FORWARD, cfg.CMD_GOAL]
-    for lo, hi, label in zip(band_edges[:-1], band_edges[1:], band_labels):
+    for lo, hi, label in zip(BAND_EDGES[:-1], BAND_EDGES[1:], BAND_LABELS):
         ax_spec.axvspan(lo, hi, color=BAND_COLORS[label], alpha=0.12)
-        ax_spec.text((lo + hi) / 2, 0, label, ha="center", va="bottom",
-                    fontsize=8, alpha=0.6, rotation=90)
+        ax_spec.text((lo + hi) / 2, 0, label, color=BAND_COLORS[label],
+                     ha="center", va="bottom", fontsize=8, fontweight="bold", rotation=90)
 
-    status_text = fig.text(0.02, 0.96, "", fontsize=12, family="monospace", va="top")
+    status_text = fig.text(0.02, 0.965, "", fontsize=12, family="monospace", va="top")
 
-    return fig, wave_line, spec_line, peak_marker, status_text
+    return fig, wave_line, specgram_im, spec_line, peak_marker, status_text
 
 
-def update_plot(_frame, wave_line, spec_line, peak_marker, status_text):
+def update_plot(_frame, wave_line, specgram_im, spec_line, peak_marker, status_text):
     with lock:
         waveform = state["waveform"]
         freqs = state["freqs"]
@@ -272,8 +387,11 @@ def update_plot(_frame, wave_line, spec_line, peak_marker, status_text):
         purity = state["purity"]
         whistle_detected = state["whistle_detected"]
         effective_command = state["effective_command"]
+        spec_history = state["spec_history"]
 
     wave_line.set_ydata(waveform)
+
+    specgram_im.set_data(spec_history)
 
     mask = freqs <= PLOT_MAX_FREQ
     spec_line.set_data(freqs[mask], magnitude[mask])
@@ -282,7 +400,7 @@ def update_plot(_frame, wave_line, spec_line, peak_marker, status_text):
 
     peak_marker.set_xdata([peak_freq, peak_freq])
 
-    color = BAND_COLORS.get(effective_command, "#000000")
+    color = BAND_COLORS.get(effective_command, "#ffffff")
     status_text.set_color(color)
     status_text.set_text(
         f"command: {effective_command:<8}  "
@@ -290,7 +408,7 @@ def update_plot(_frame, wave_line, spec_line, peak_marker, status_text):
         f"peak={peak_freq:6.0f} Hz   purity={purity:4.2f}   rms={rms:5.3f}"
     )
 
-    return wave_line, spec_line, peak_marker, status_text
+    return wave_line, specgram_im, spec_line, peak_marker, status_text
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +426,8 @@ def list_devices():
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Whistle-controlled driving commands over MQTT")
+    parser.add_argument("--channel", required=True, choices=["steer", "throttle"],
+                        help="Which axis this person/laptop is controlling")
     parser.add_argument("--device", type=int, default=None,
                         help="Input device index (see --list-devices)")
     parser.add_argument("--list-devices", action="store_true",
@@ -316,21 +436,29 @@ def parse_args():
 
 
 def main():
+    global BAND_EDGES, BAND_LABELS, BAND_COLORS, running
+
     args = parse_args()
     if args.list_devices:
         list_devices()
         return
 
-    global running
+    channel = CHANNELS[args.channel]
+    BAND_EDGES = channel["band_edges"]
+    BAND_LABELS = channel["band_labels"]
+    BAND_COLORS = channel["colors"]
+
     mqtt_client = MQTTClient()
     mqtt_client.connect()
-    print(f"Publishing driving commands to '{cfg.DRIVE_TOPIC}'")
+    print(f"[{args.channel}] Publishing commands to '{channel['topic']}'")
 
-    audio_thread = threading.Thread(target=audio_thread_fn, args=(args.device, mqtt_client), daemon=True)
+    audio_thread = threading.Thread(target=audio_thread_fn,
+                                    args=(args.device, mqtt_client, channel), daemon=True)
     audio_thread.start()
 
-    fig, wave_line, spec_line, peak_marker, status_text = build_plot()
-    ani = FuncAnimation(fig, update_plot, fargs=(wave_line, spec_line, peak_marker, status_text),
+    fig, wave_line, specgram_im, spec_line, peak_marker, status_text = build_plot(args.channel)
+    ani = FuncAnimation(fig, update_plot,
+                        fargs=(wave_line, specgram_im, spec_line, peak_marker, status_text),
                         interval=80, cache_frame_data=False)
 
     def on_close(_event):
@@ -344,7 +472,7 @@ def main():
     finally:
         running = False
         audio_thread.join(timeout=2)
-        mqtt_client.publish(cfg.DRIVE_TOPIC, cfg.CMD_STOP)  # leave the robot stopped on exit
+        mqtt_client.publish(channel["topic"], channel["default_command"])  # leave in a safe neutral state on exit
         time.sleep(0.2)
         mqtt_client.disconnect()
 
