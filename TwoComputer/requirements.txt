@@ -1,0 +1,4 @@
+legoeducation==1.1.1   # main_computer.py, lelib.py -- LEGO Education hub BLE protocol
+numpy==2.5.3           # whistle_detector.py -- FFT and array math
+PyAudio==0.2.14        # remote_computer.py, main_computer.py -- microphone capture
+paho-mqtt==2.1.0       # mqttlib.py -- MQTT publish/subscribe
