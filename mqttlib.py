@@ -28,6 +28,12 @@ class MQTTClient:
         self._client.disconnect()
         self._connected.clear()
 
+    def is_connected(self):
+        """True only if the broker actually confirmed the connection (via
+        on_connect) -- connect()'s wait(timeout) returns either way, so this
+        is how a caller tells a real connection apart from a silent timeout."""
+        return self._connected.is_set()
+
     def publish(self, topic, message, qos=0, retain=False):
         self._client.publish(topic, message, qos=qos, retain=retain)
 

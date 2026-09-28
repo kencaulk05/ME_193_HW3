@@ -63,6 +63,14 @@ DRIVE_COMMAND_TIMEOUT = 2.0  # seconds
 INVERT_LEFT_MOTOR = False
 INVERT_RIGHT_MOTOR = True
 
+# Diagnostic: drive forward for a few seconds right after connecting, using
+# the exact same Car.drive()/Car.stop() calls the real MQTT-driven path
+# uses -- confirms the motor path works in this actual file (not just in
+# test_drive.py's standalone copy) before waiting on any whistle/MQTT
+# input. Set to False once you've confirmed driving works.
+STARTUP_TEST_DRIVE = False
+STARTUP_TEST_DRIVE_SECONDS = 2.0
+
 
 # ---------------------------------------------------------------------------
 # Motor control
@@ -78,8 +86,19 @@ class Car:
             print("[car] SIMULATE mode: not connecting to real hardware.")
             return
         self.dm = doubleMotor()
-        print("[car] Scanning for the Double Motor hub...")
-        self.dm.connect()
+        print("[car] Waiting for the Double Motor (must match the card color/"
+              "serial in game_config.py) -- power it on, tap the card, and "
+              "bring it in range.")
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                self.dm.connect(card_color=cfg.CARD_COLOR, card_serial=cfg.CARD_SERIAL)
+                break
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                print(f"[car] Still not connected (attempt {attempt}): {exc} -- retrying...")
         print("[car] Connected.")
 
     def drive(self, left_speed, right_speed):
@@ -95,10 +114,13 @@ class Car:
         if abs(speed) < 1:
             self.dm.motor_stop(motor=motor_side)
         else:
-            direction = (le.MOTOR_MOVE_DIRECTION_CLOCKWISE if speed > 0
-                         else le.MOTOR_MOVE_DIRECTION_COUNTERCLOCKWISE)
-            self.dm.motor_run(direction=direction, motor=motor_side,
-                               speed=float(abs(speed)), blocking=False)
+            # Pass the signed speed directly and leave direction at its
+            # CLOCKWISE default -- lelib.py's own run() methods note this
+            # is the pattern confirmed working on real hardware (a
+            # negative speed reverses direction on its own). Manually
+            # picking a direction and passing abs(speed) instead isn't the
+            # tested combination and is the likely cause of "not driving."
+            self.dm.motor_run(motor=motor_side, speed=speed, blocking=False)
 
     def stop(self):
         self.drive(0, 0)
@@ -140,8 +162,19 @@ class ProximitySensor:
             print("[sensor] SIMULATE mode: not connecting to real hardware.")
             return
         self.sensor = colorSensor()
-        print("[sensor] Scanning for the Color Sensor...")
-        self.sensor.connect(card_serial=None)
+        print("[sensor] Waiting for the Color Sensor (must match the card color/"
+              "serial in game_config.py) -- power it on, tap the card, and "
+              "bring it in range.")
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                self.sensor.connect(card_serial=cfg.CARD_SERIAL, card_color=cfg.CARD_COLOR)
+                break
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                print(f"[sensor] Still not connected (attempt {attempt}): {exc} -- retrying...")
         print("[sensor] Connected.")
 
     def reflection(self):
@@ -180,7 +213,14 @@ def on_drive_message(topic, payload, car, state):
         return  # never a literal drive speed, don't fall through to apply_drive_command
 
     state.last_drive_command = payload
-    apply_drive_command(car, payload)
+    try:
+        apply_drive_command(car, payload)
+    except Exception as exc:
+        # This runs on the MQTT client's own callback thread -- an
+        # exception here otherwise gets logged by paho-mqtt internally and
+        # never surfaces to the main script, which just looks like the car
+        # silently isn't driving. Print it loudly instead.
+        print(f"[game] ERROR applying drive command {payload!r}: {exc}")
 
 
 def on_game_message(topic, payload, state):
@@ -244,6 +284,13 @@ def main():
 
     car = Car(simulate=args.simulate)
     car.connect()
+
+    if STARTUP_TEST_DRIVE:
+        print(f"[game] Startup test: driving forward for {STARTUP_TEST_DRIVE_SECONDS:.1f}s...")
+        car.drive(DRIVE_SPEED, DRIVE_SPEED)
+        time.sleep(STARTUP_TEST_DRIVE_SECONDS)
+        car.stop()
+        print("[game] Startup test complete.")
 
     sensor = None
     if args.role == "ball":

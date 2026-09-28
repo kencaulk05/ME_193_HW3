@@ -6,6 +6,18 @@ names and command strings can never accidentally drift apart between the
 two files (or between your laptop and your teammate's).
 """
 
+import legoeducation as le
+
+# --- Bluetooth card info for your hardware -----------------------------------
+# Fill these in with the color/serial printed on your LEGO connection card.
+# game_logic.py is the only script that ever connects to hardware (see its
+# docstring for why) -- both the Double Motor and the Color Sensor pair
+# with this same card. Set both to None to instead connect to the first
+# advertising device of each type found, if you only have one of each
+# nearby and don't need to disambiguate.
+CARD_COLOR = le.LEGO_COLOR_PURPLE
+CARD_SERIAL = 6056
+
 # --- Identify your team -----------------------------------------------------
 # Change this to something unique to your group so your local drive channel
 # doesn't collide with another team's on the public test.mosquitto.org

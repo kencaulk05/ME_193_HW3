@@ -128,9 +128,17 @@ Three separate gates, all of which have to pass before a frame counts as
 1. **Frequency range gate** — only search for a peak between 300–5000 Hz,
    which cuts out low rumble (footsteps, HVAC, handling the mic) and
    ignores anything above typical whistle range.
-2. **Amplitude (RMS) gate** — quiet background noise can still have *some*
-   dominant frequency, so a loudness floor (`SILENCE_RMS`) rejects anything
-   too quiet to plausibly be a deliberate whistle.
+2. **Adaptive, hysteresis-based amplitude (RMS) gate** — a single fixed
+   loudness threshold would need one number that works in both a silent
+   room and a loud gym, so instead we track a running estimate of the
+   ambient noise floor (`noise_floor`, an EMA updated only while *not*
+   currently classified as whistling, so an ongoing whistle never gets
+   absorbed into "the new background level") and gate relative to that.
+   On top of being adaptive, it's also a Schmitt trigger: *starting* to
+   count as a whistle requires clearing a bigger multiple of the floor
+   (`NOISE_ENTER_MULTIPLE`) than *continuing* to count as one does
+   (`NOISE_EXIT_MULTIPLE`) — otherwise a whistle whose volume hovers right
+   at a single threshold flickers in and out of detection every frame.
 3. **Spectral purity gate** — this is the one that actually distinguishes a
    whistle from other *loud* sounds, like talking or a clap. A whistle is
    close to a pure tone, so almost all of its energy sits in one narrow
@@ -139,7 +147,23 @@ Three separate gates, all of which have to pass before a frame counts as
    (0.35). Broadband sounds spread their energy across many frequencies
    and fail this even when they're loud enough to pass the RMS gate.
 
-On top of the gates, the debounce requirement (3 consecutive matching
-frames) acts as a second, temporal layer of noise rejection — a single
-stray frame that slips past all three gates still can't flip the
-committed command on its own.
+Two more layers work on top of the gates, at different points in the
+pipeline:
+
+- **Frequency-estimate smoothing** — before a whistle-passing frame's peak
+  frequency ever reaches classification, it's folded into a rolling median
+  (`FREQ_SMOOTHING_FRAMES`) of the last several whistle-only readings. This
+  catches a different failure mode than the gates above: a single noisy
+  frame whose *peak itself* briefly lands in the wrong place (e.g. a stray
+  harmonic) can't shift the classification on its own, even though that
+  frame legitimately passed every gate.
+- **Debounce** (3 consecutive matching classifications) is a second,
+  temporal layer of rejection after that — a single stray frame that
+  slips past every gate and isn't smoothed away still can't flip the
+  committed command on its own.
+
+One limitation these don't solve: none of this can tell *your* whistle
+apart from someone else's whistle nearby — both are pure tones in a
+plausible range. That would need per-person timbre/voice-print
+classification, which is a much bigger undertaking than a homework-scale
+noise gate.

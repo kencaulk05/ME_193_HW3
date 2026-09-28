@@ -31,8 +31,50 @@ import pyaudio
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 
+import legoeducation as le
+from lelib import doubleMotor
+
 from mqttlib import MQTTClient
 import game_config as cfg
+
+# ---------------------------------------------------------------------------
+# Diagnostic: direct hardware self-test at startup
+# ---------------------------------------------------------------------------
+# This script isn't supposed to own the hub connection long-term (see the
+# docstring above -- that's game_logic.py's job), but while MQTT isn't
+# confirming a connection, that blocks testing the drive path through the
+# normal whistle -> MQTT -> game_logic.py chain entirely. This connects
+# directly, drives forward briefly, and disconnects immediately --
+# independent of MQTT's status -- purely to prove the car itself works.
+# Set to False once MQTT is sorted out and/or you no longer need this.
+STARTUP_TEST_DRIVE = False
+STARTUP_TEST_DRIVE_SPEED = 50
+STARTUP_TEST_DRIVE_SECONDS = 2.0
+
+
+def startup_test_drive():
+    dm = doubleMotor()
+    print("[whistle] Startup test: connecting directly to the Double Motor "
+          "(card color/serial from game_config.py)...")
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            dm.connect(card_color=cfg.CARD_COLOR, card_serial=cfg.CARD_SERIAL)
+            break
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            print(f"[whistle] Still not connected (attempt {attempt}): {exc} -- retrying...")
+    print("[whistle] Connected. Driving forward "
+          f"for {STARTUP_TEST_DRIVE_SECONDS:.1f}s...")
+    dm.motor_run(motor=le.MOTOR_LEFT, speed=float(STARTUP_TEST_DRIVE_SPEED), blocking=False)
+    dm.motor_run(motor=le.MOTOR_RIGHT, speed=float(-STARTUP_TEST_DRIVE_SPEED), blocking=False)
+    time.sleep(STARTUP_TEST_DRIVE_SECONDS)
+    dm.motor_stop(motor=le.MOTOR_BOTH)
+    dm.disconnect()
+    print("[whistle] Startup test complete -- disconnected (BLE slot freed for game_logic.py).")
+
 
 # ---------------------------------------------------------------------------
 # Audio settings
@@ -73,11 +115,36 @@ _SPEC_HISTORY_COLUMNS = max(1, int(SPEC_HISTORY_SECONDS / (CHUNK / SAMPLE_RATE))
 ANALYSIS_MIN_FREQ = 300
 ANALYSIS_MAX_FREQ = 5000
 
-# RMS amplitude gate: below this, treat the buffer as silence regardless of
-# what the FFT says (quiet background hum can still have a "peak" that
-# means nothing). Calibrate by watching the printed RMS value in a quiet
-# room vs. while whistling.
-SILENCE_RMS = 0.02
+# --- Adaptive RMS gate ---
+# A fixed RMS threshold means picking one number that has to work in both a
+# silent room and a loud gym. Instead, track a running estimate of the
+# ambient noise floor and gate relative to *that* -- it adapts on its own as
+# the room gets louder/quieter over the course of a game.
+#
+# The floor is only updated while NOT currently classified as whistling, so
+# an ongoing whistle doesn't get absorbed into "the new background level."
+# NOISE_FLOOR_EMA_ALPHA is small/slow on purpose -- it should track the
+# room's ambient level over seconds, not react to any single quiet gap
+# between whistles.
+NOISE_FLOOR_EMA_ALPHA = 0.02
+NOISE_FLOOR_MIN = 0.005   # floor never adapts below this (avoids a
+                          # near-zero floor making the gate hypersensitive
+                          # in a dead-silent room)
+
+# Hysteresis: separate thresholds for *starting* vs. *continuing* to count
+# as a whistle, as multiples of the current noise floor. Without this, a
+# whistle whose RMS hovers right at a single threshold flickers rapidly
+# in and out of detection; requiring a bigger jump to start than to keep
+# going (a Schmitt trigger) makes that boundary far less twitchy.
+NOISE_ENTER_MULTIPLE = 4.0   # must clear this far above the floor to start
+NOISE_EXIT_MULTIPLE = 2.5    # can drop to this far above the floor and still count
+
+# How many recent whistle-only peak-frequency readings to take the median
+# of before classifying. This is a second, independent layer on top of the
+# purity gate and the band debounce below -- it smooths single-frame
+# outliers in the *continuous* frequency estimate itself, before it ever
+# gets bucketed into a discrete band.
+FREQ_SMOOTHING_FRAMES = 5
 
 # Spectral purity gate: whistles are close to pure tones, so almost all
 # their energy sits in one narrow peak. Talking, claps, and general room
@@ -150,6 +217,8 @@ state = {
     "raw_command": None,       # this frame's classification, or None
     "effective_command": cfg.CMD_STOP,  # what we've actually published
     "spec_history": np.full((_DISPLAY_BIN_COUNT, _SPEC_HISTORY_COLUMNS), SPEC_DB_FLOOR, dtype=np.float32),
+    "noise_floor": NOISE_FLOOR_MIN,
+    "rms_threshold": NOISE_FLOOR_MIN * NOISE_ENTER_MULTIPLE,
 }
 running = True
 
@@ -187,10 +256,13 @@ def audio_thread_fn(device_index, mqtt_client):
 
     rolling = np.zeros(WINDOW_SIZE, dtype=np.float32)
     recent_classifications = deque(maxlen=DEBOUNCE_FRAMES)
+    recent_peak_freqs = deque(maxlen=FREQ_SMOOTHING_FRAMES)
     stable_command = None
     last_whistle_time = time.monotonic()
     last_published = None
     spec_history = state["spec_history"].copy()
+    noise_floor = NOISE_FLOOR_MIN
+    currently_whistling = False
 
     print("Listening... whistle to drive. Ctrl+C or close the plot window to quit.")
 
@@ -203,8 +275,33 @@ def audio_thread_fn(device_index, mqtt_client):
             rolling[-len(chunk):] = chunk
 
             rms, freqs, magnitude, peak_freq, purity = analyze_buffer(rolling)
-            is_whistle = (rms >= SILENCE_RMS) and (purity >= PURITY_THRESHOLD)
-            raw_command = classify_frequency(peak_freq) if is_whistle else None
+
+            # Adaptive + hysteresis RMS gate: which multiple of the current
+            # noise floor applies depends on whether we were already
+            # whistling last frame (enter needs a bigger jump than exit
+            # needs to sustain), so a borderline signal doesn't chatter.
+            rms_threshold = noise_floor * (NOISE_EXIT_MULTIPLE if currently_whistling else NOISE_ENTER_MULTIPLE)
+            is_whistle = (rms >= rms_threshold) and (purity >= PURITY_THRESHOLD)
+            currently_whistling = is_whistle
+
+            # Only drift the floor toward the ambient level while NOT
+            # whistling, so an ongoing whistle never gets absorbed into
+            # "the new background level."
+            if not is_whistle:
+                noise_floor = (1 - NOISE_FLOOR_EMA_ALPHA) * noise_floor + NOISE_FLOOR_EMA_ALPHA * rms
+                noise_floor = max(noise_floor, NOISE_FLOOR_MIN)
+
+            # Median-smooth the frequency estimate over the last few
+            # whistle-only frames before classifying, so one noisy frame's
+            # peak can't shift the picked band on its own.
+            if is_whistle:
+                recent_peak_freqs.append(peak_freq)
+                smoothed_freq = float(np.median(recent_peak_freqs))
+            else:
+                recent_peak_freqs.clear()
+                smoothed_freq = peak_freq
+
+            raw_command = classify_frequency(smoothed_freq) if is_whistle else None
 
             now = time.monotonic()
             if is_whistle:
@@ -226,7 +323,8 @@ def audio_thread_fn(device_index, mqtt_client):
             if effective_command != last_published:
                 mqtt_client.publish(cfg.DRIVE_TOPIC, effective_command)
                 print(f"[whistle] -> {effective_command}  "
-                      f"(peak={peak_freq:.0f}Hz purity={purity:.2f} rms={rms:.3f})")
+                      f"(peak={smoothed_freq:.0f}Hz purity={purity:.2f} rms={rms:.3f} "
+                      f"floor={noise_floor:.3f} threshold={rms_threshold:.3f})")
                 last_published = effective_command
 
             # Scroll this frame's magnitude spectrum (cropped to the display
@@ -240,13 +338,15 @@ def audio_thread_fn(device_index, mqtt_client):
                 state["waveform"] = rolling.copy()
                 state["freqs"] = freqs
                 state["magnitude"] = magnitude
-                state["peak_freq"] = peak_freq
+                state["peak_freq"] = smoothed_freq
                 state["rms"] = rms
                 state["purity"] = purity
                 state["whistle_detected"] = is_whistle
                 state["raw_command"] = raw_command
                 state["spec_history"] = spec_history
                 state["effective_command"] = effective_command
+                state["noise_floor"] = noise_floor
+                state["rms_threshold"] = rms_threshold
     finally:
         stream.stop_stream()
         stream.close()
@@ -334,6 +434,7 @@ def update_plot(_frame, wave_line, specgram_im, spec_line, peak_marker, status_t
         whistle_detected = state["whistle_detected"]
         effective_command = state["effective_command"]
         spec_history = state["spec_history"]
+        rms_threshold = state["rms_threshold"]
 
     wave_line.set_ydata(waveform)
 
@@ -351,7 +452,8 @@ def update_plot(_frame, wave_line, specgram_im, spec_line, peak_marker, status_t
     status_text.set_text(
         f"command: {effective_command:<8}  "
         f"{'WHISTLE' if whistle_detected else 'no whistle':<10}  "
-        f"peak={peak_freq:6.0f} Hz   purity={purity:4.2f}   rms={rms:5.3f}"
+        f"peak={peak_freq:6.0f} Hz   purity={purity:4.2f}   "
+        f"rms={rms:5.3f}   threshold={rms_threshold:5.3f}"
     )
 
     return wave_line, specgram_im, spec_line, peak_marker, status_text
@@ -385,9 +487,22 @@ def main():
         list_devices()
         return
 
+    if STARTUP_TEST_DRIVE:
+        startup_test_drive()
+
     global running
     mqtt_client = MQTTClient()
-    mqtt_client.connect()
+    print(f"[whistle] Connecting to MQTT broker ({mqtt_client.broker})...")
+    attempt = 0
+    while True:
+        attempt += 1
+        mqtt_client.connect()
+        if mqtt_client.is_connected():
+            break
+        print(f"[whistle] Still not connected (attempt {attempt}) -- "
+              f"check your network/broker reachability. Retrying...")
+        mqtt_client.disconnect()
+    print(f"[whistle] Connected to MQTT broker ({mqtt_client.broker}).")
     print(f"Publishing driving commands to '{cfg.DRIVE_TOPIC}'")
 
     audio_thread = threading.Thread(target=audio_thread_fn, args=(args.device, mqtt_client), daemon=True)
