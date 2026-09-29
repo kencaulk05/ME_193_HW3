@@ -42,10 +42,15 @@ ACCEPTED_RANGE_COLOR = "#22c55e"
 
 class WhistleMonitor:
     def __init__(self, title, analysis_min_freq, analysis_max_freq,
-                 max_freq_display=5000, chunk_size=1024):
+                 max_freq_display=5000, chunk_size=1024, bands=None):
+        """bands: optional list of (min_freq, max_freq, label, color) tuples
+        to shade/label instead of a single "ACCEPTED RANGE" block -- use
+        this when a script classifies sub-bands within its overall
+        analysis range (e.g. a FORWARD band and a separate GOAL band)."""
         self.title = title
         self.analysis_min_freq = analysis_min_freq
         self.analysis_max_freq = analysis_max_freq
+        self.bands = bands or [(analysis_min_freq, analysis_max_freq, "ACCEPTED RANGE", ACCEPTED_RANGE_COLOR)]
         # The accepted range has to actually fit on screen to be shaded.
         self.max_freq_display = max(max_freq_display, analysis_max_freq)
         self.chunk_size = chunk_size
@@ -117,12 +122,11 @@ class WhistleMonitor:
         ax_specgram.set_title("Live spectrogram")
         fig.colorbar(specgram_im, ax=ax_specgram, pad=0.01, label="Magnitude (dB)")
 
-        ax_specgram.axhspan(self.analysis_min_freq, self.analysis_max_freq,
-                             color=ACCEPTED_RANGE_COLOR, alpha=0.18)
-        ax_specgram.text(-SPEC_HISTORY_SECONDS + 0.15,
-                          (self.analysis_min_freq + self.analysis_max_freq) / 2,
-                          "ACCEPTED RANGE", color=ACCEPTED_RANGE_COLOR,
-                          fontsize=9, fontweight="bold", ha="left", va="center")
+        for band_min, band_max, label, color in self.bands:
+            ax_specgram.axhspan(band_min, band_max, color=color, alpha=0.18)
+            ax_specgram.text(-SPEC_HISTORY_SECONDS + 0.15, (band_min + band_max) / 2,
+                              label, color=color, fontsize=9, fontweight="bold",
+                              ha="left", va="center")
 
         spec_line, = ax_spec.plot([], [], linewidth=0.9, color="#e5e5e5")
         peak_marker = ax_spec.axvline(0, color="#ef4444", linestyle="--", linewidth=1.5)
@@ -130,11 +134,10 @@ class WhistleMonitor:
         ax_spec.set_xlabel("Frequency (Hz)")
         ax_spec.set_ylabel("Magnitude")
         ax_spec.set_title("Live spectrum + decision")
-        ax_spec.axvspan(self.analysis_min_freq, self.analysis_max_freq,
-                         color=ACCEPTED_RANGE_COLOR, alpha=0.12)
-        ax_spec.text((self.analysis_min_freq + self.analysis_max_freq) / 2, 0,
-                      "ACCEPTED RANGE", color=ACCEPTED_RANGE_COLOR,
-                      ha="center", va="bottom", fontsize=8, fontweight="bold", rotation=90)
+        for band_min, band_max, label, color in self.bands:
+            ax_spec.axvspan(band_min, band_max, color=color, alpha=0.12)
+            ax_spec.text((band_min + band_max) / 2, 0, label, color=color,
+                          ha="center", va="bottom", fontsize=8, fontweight="bold", rotation=90)
 
         status_text = fig.text(0.02, 0.965, "", fontsize=12, family="monospace", va="top")
 

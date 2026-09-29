@@ -37,8 +37,8 @@ CHUNK = 1024
 # this computer to only respond to a specific pitch register. This is
 # intentionally independent from main_computer.py's own
 # ANALYSIS_MIN_FREQ/MAX_FREQ -- the two can be tuned to different ranges.
-ANALYSIS_MIN_FREQ = 300
-ANALYSIS_MAX_FREQ = 5000
+ANALYSIS_MIN_FREQ = 2000
+ANALYSIS_MAX_FREQ = 3000
 
 
 def list_devices():
