@@ -7,30 +7,17 @@ execute on the actual robot. This script never touches the hub directly --
 see the README for why (BLE only allows one connection to a hub at a time,
 so only game_logic.py owns that connection).
 
-Two people, two channels: everyone's natural whistle range is different,
-so rather than one shared 5-band scheme (which broke when one person's
-whistle simply couldn't reach another person's assigned band), each person
-runs this with their OWN --channel, each with its own independently
-tunable band thresholds and its own MQTT topic:
-
-    --channel steer     2-3 bands: LEFT / STRAIGHT / RIGHT
-    --channel throttle   2-3 bands: STOP / FORWARD / GOAL (special)
-
-game_logic.py subscribes to both topics and continuously mixes the two
-most recent commands together into actual wheel speeds.
-
-Shows a live plot: the raw waveform, a scrolling spectrogram, and the
-current spectrum with THIS CHANNEL's bands shaded and the detected peak
-marked, plus a text readout of the live decision.
+Shows a live two-panel plot: the raw waveform on top, the frequency
+spectrum (with the pitch bands shaded and the detected peak marked) on the
+bottom, plus a text readout of the live decision.
 
 Install first:
     pip install pyaudio numpy matplotlib
 
 Usage:
-    python whistle_drive.py --channel steer
-    python whistle_drive.py --channel throttle
-    python whistle_drive.py --channel steer --list-devices   # find your mic's device index
-    python whistle_drive.py --channel steer --device 2
+    python whistle_drive.py
+    python whistle_drive.py --list-devices     # find your mic's device index
+    python whistle_drive.py --device 2
 Close the plot window to quit.
 """
 
@@ -44,8 +31,50 @@ import pyaudio
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 
+import legoeducation as le
+from lelib import doubleMotor
+
 from mqttlib import MQTTClient
 import game_config as cfg
+
+# ---------------------------------------------------------------------------
+# Diagnostic: direct hardware self-test at startup
+# ---------------------------------------------------------------------------
+# This script isn't supposed to own the hub connection long-term (see the
+# docstring above -- that's game_logic.py's job), but while MQTT isn't
+# confirming a connection, that blocks testing the drive path through the
+# normal whistle -> MQTT -> game_logic.py chain entirely. This connects
+# directly, drives forward briefly, and disconnects immediately --
+# independent of MQTT's status -- purely to prove the car itself works.
+# Set to False once MQTT is sorted out and/or you no longer need this.
+STARTUP_TEST_DRIVE = False
+STARTUP_TEST_DRIVE_SPEED = 50
+STARTUP_TEST_DRIVE_SECONDS = 2.0
+
+
+def startup_test_drive():
+    dm = doubleMotor()
+    print("[whistle] Startup test: connecting directly to the Double Motor "
+          "(card color/serial from game_config.py)...")
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            dm.connect(card_color=cfg.CARD_COLOR, card_serial=cfg.CARD_SERIAL)
+            break
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            print(f"[whistle] Still not connected (attempt {attempt}): {exc} -- retrying...")
+    print("[whistle] Connected. Driving forward "
+          f"for {STARTUP_TEST_DRIVE_SECONDS:.1f}s...")
+    dm.motor_run(motor=le.MOTOR_LEFT, speed=float(STARTUP_TEST_DRIVE_SPEED), blocking=False)
+    dm.motor_run(motor=le.MOTOR_RIGHT, speed=float(-STARTUP_TEST_DRIVE_SPEED), blocking=False)
+    time.sleep(STARTUP_TEST_DRIVE_SECONDS)
+    dm.motor_stop(motor=le.MOTOR_BOTH)
+    dm.disconnect()
+    print("[whistle] Startup test complete -- disconnected (BLE slot freed for game_logic.py).")
+
 
 # ---------------------------------------------------------------------------
 # Audio settings
@@ -86,11 +115,36 @@ _SPEC_HISTORY_COLUMNS = max(1, int(SPEC_HISTORY_SECONDS / (CHUNK / SAMPLE_RATE))
 ANALYSIS_MIN_FREQ = 300
 ANALYSIS_MAX_FREQ = 5000
 
-# RMS amplitude gate: below this, treat the buffer as silence regardless of
-# what the FFT says (quiet background hum can still have a "peak" that
-# means nothing). Calibrate by watching the printed RMS value in a quiet
-# room vs. while whistling.
-SILENCE_RMS = 0.02
+# --- Adaptive RMS gate ---
+# A fixed RMS threshold means picking one number that has to work in both a
+# silent room and a loud gym. Instead, track a running estimate of the
+# ambient noise floor and gate relative to *that* -- it adapts on its own as
+# the room gets louder/quieter over the course of a game.
+#
+# The floor is only updated while NOT currently classified as whistling, so
+# an ongoing whistle doesn't get absorbed into "the new background level."
+# NOISE_FLOOR_EMA_ALPHA is small/slow on purpose -- it should track the
+# room's ambient level over seconds, not react to any single quiet gap
+# between whistles.
+NOISE_FLOOR_EMA_ALPHA = 0.02
+NOISE_FLOOR_MIN = 0.005   # floor never adapts below this (avoids a
+                          # near-zero floor making the gate hypersensitive
+                          # in a dead-silent room)
+
+# Hysteresis: separate thresholds for *starting* vs. *continuing* to count
+# as a whistle, as multiples of the current noise floor. Without this, a
+# whistle whose RMS hovers right at a single threshold flickers rapidly
+# in and out of detection; requiring a bigger jump to start than to keep
+# going (a Schmitt trigger) makes that boundary far less twitchy.
+NOISE_ENTER_MULTIPLE = 4.0   # must clear this far above the floor to start
+NOISE_EXIT_MULTIPLE = 2.5    # can drop to this far above the floor and still count
+
+# How many recent whistle-only peak-frequency readings to take the median
+# of before classifying. This is a second, independent layer on top of the
+# purity gate and the band debounce below -- it smooths single-frame
+# outliers in the *continuous* frequency estimate itself, before it ever
+# gets bucketed into a discrete band.
+FREQ_SMOOTHING_FRAMES = 5
 
 # Spectral purity gate: whistles are close to pure tones, so almost all
 # their energy sits in one narrow peak. Talking, claps, and general room
@@ -102,73 +156,42 @@ PURITY_THRESHOLD = 0.35
 PURITY_BAND_HZ = 60  # width around the peak counted as "the peak's energy"
 
 # ---------------------------------------------------------------------------
-# Pitch bands -> commands, one independent scheme per channel
+# Pitch bands -> driving commands
 # ---------------------------------------------------------------------------
-# CALIBRATE THESE against YOUR OWN whistle range: run
+# CALIBRATE THESE against your own whistle range: run
 #   python whistle_recorder.py
 # a few times, whistle low/medium/high/very-high, and read off the printed
-# "Dominant frequency" each time. Whoever is running --channel steer only
-# needs to reliably hit two or three of their own comfortable pitches; same
-# for --channel throttle. The two people's thresholds don't need to relate
-# to each other at all -- that's the whole point of splitting the channels.
+# "Dominant frequency" each time. Typical whistling covers roughly 500-4000
+# Hz, but everyone's range differs -- these are starting points, not truth.
 
-# --- steer channel: LEFT / STRAIGHT (neutral) / RIGHT ---
-STEER_LEFT_MAX = 900        # freq below this -> LEFT
-STEER_STRAIGHT_MAX = 1500   # freq below this (and above STEER_LEFT_MAX) -> STRAIGHT
-# freq above STEER_STRAIGHT_MAX -> RIGHT
+BAND_STOP_MAX = 700       # freq below this -> stop
+BAND_LEFT_MAX = 1300      # freq below this (and above BAND_STOP_MAX) -> turn left
+BAND_RIGHT_MAX = 2000     # freq below this (and above BAND_LEFT_MAX) -> turn right
+BAND_FORWARD_MAX = 3200   # freq below this (and above BAND_RIGHT_MAX) -> speed up / forward
+# freq above BAND_FORWARD_MAX -> CMD_GOAL (the special "I scored" whistle) --
+# deliberately a hard-to-hit-by-accident range at the very top of most
+# people's whistling register.
 
-# --- throttle channel: STOP / FORWARD / GOAL (special) ---
-THROTTLE_STOP_MAX = 900     # freq below this -> STOP
-THROTTLE_GOAL_MIN = 3200    # freq above this -> GOAL (special "I scored" whistle --
-                            # deliberately a hard-to-hit-by-accident range at
-                            # the very top of the throttle-whistler's register)
-# freq between THROTTLE_STOP_MAX and THROTTLE_GOAL_MIN -> FORWARD
-
-
-def classify_steer(freq_hz):
-    if freq_hz < STEER_LEFT_MAX:
-        return cfg.CMD_LEFT
-    elif freq_hz < STEER_STRAIGHT_MAX:
-        return cfg.CMD_STRAIGHT
-    else:
-        return cfg.CMD_RIGHT
+BAND_COLORS = {
+    cfg.CMD_STOP: "#888888",
+    cfg.CMD_LEFT: "#3b82f6",
+    cfg.CMD_RIGHT: "#f59e0b",
+    cfg.CMD_FORWARD: "#22c55e",
+    cfg.CMD_GOAL: "#ef4444",
+}
 
 
-def classify_throttle(freq_hz):
-    if freq_hz < THROTTLE_STOP_MAX:
+def classify_frequency(freq_hz):
+    if freq_hz < BAND_STOP_MAX:
         return cfg.CMD_STOP
-    elif freq_hz < THROTTLE_GOAL_MIN:
+    elif freq_hz < BAND_LEFT_MAX:
+        return cfg.CMD_LEFT
+    elif freq_hz < BAND_RIGHT_MAX:
+        return cfg.CMD_RIGHT
+    elif freq_hz < BAND_FORWARD_MAX:
         return cfg.CMD_FORWARD
     else:
         return cfg.CMD_GOAL
-
-
-CHANNELS = {
-    "steer": {
-        "topic": cfg.STEER_TOPIC,
-        "classify": classify_steer,
-        "band_edges": [0, STEER_LEFT_MAX, STEER_STRAIGHT_MAX, PLOT_MAX_FREQ],
-        "band_labels": [cfg.CMD_LEFT, cfg.CMD_STRAIGHT, cfg.CMD_RIGHT],
-        "default_command": cfg.CMD_STRAIGHT,
-        "colors": {
-            cfg.CMD_LEFT: "#3b82f6",
-            cfg.CMD_STRAIGHT: "#888888",
-            cfg.CMD_RIGHT: "#f59e0b",
-        },
-    },
-    "throttle": {
-        "topic": cfg.THROTTLE_TOPIC,
-        "classify": classify_throttle,
-        "band_edges": [0, THROTTLE_STOP_MAX, THROTTLE_GOAL_MIN, PLOT_MAX_FREQ],
-        "band_labels": [cfg.CMD_STOP, cfg.CMD_FORWARD, cfg.CMD_GOAL],
-        "default_command": cfg.CMD_STOP,
-        "colors": {
-            cfg.CMD_STOP: "#888888",
-            cfg.CMD_FORWARD: "#22c55e",
-            cfg.CMD_GOAL: "#ef4444",
-        },
-    },
-}
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +217,8 @@ state = {
     "raw_command": None,       # this frame's classification, or None
     "effective_command": cfg.CMD_STOP,  # what we've actually published
     "spec_history": np.full((_DISPLAY_BIN_COUNT, _SPEC_HISTORY_COLUMNS), SPEC_DB_FLOOR, dtype=np.float32),
+    "noise_floor": NOISE_FLOOR_MIN,
+    "rms_threshold": NOISE_FLOOR_MIN * NOISE_ENTER_MULTIPLE,
 }
 running = True
 
@@ -223,11 +248,7 @@ def analyze_buffer(buffer):
     return rms, freqs, magnitude, peak_freq, purity
 
 
-def audio_thread_fn(device_index, mqtt_client, channel):
-    classify = channel["classify"]
-    topic = channel["topic"]
-    default_command = channel["default_command"]
-
+def audio_thread_fn(device_index, mqtt_client):
     p = pyaudio.PyAudio()
     stream = p.open(format=pyaudio.paFloat32, channels=1, rate=SAMPLE_RATE,
                     input=True, input_device_index=device_index,
@@ -235,10 +256,13 @@ def audio_thread_fn(device_index, mqtt_client, channel):
 
     rolling = np.zeros(WINDOW_SIZE, dtype=np.float32)
     recent_classifications = deque(maxlen=DEBOUNCE_FRAMES)
+    recent_peak_freqs = deque(maxlen=FREQ_SMOOTHING_FRAMES)
     stable_command = None
     last_whistle_time = time.monotonic()
     last_published = None
     spec_history = state["spec_history"].copy()
+    noise_floor = NOISE_FLOOR_MIN
+    currently_whistling = False
 
     print("Listening... whistle to drive. Ctrl+C or close the plot window to quit.")
 
@@ -251,8 +275,33 @@ def audio_thread_fn(device_index, mqtt_client, channel):
             rolling[-len(chunk):] = chunk
 
             rms, freqs, magnitude, peak_freq, purity = analyze_buffer(rolling)
-            is_whistle = (rms >= SILENCE_RMS) and (purity >= PURITY_THRESHOLD)
-            raw_command = classify(peak_freq) if is_whistle else None
+
+            # Adaptive + hysteresis RMS gate: which multiple of the current
+            # noise floor applies depends on whether we were already
+            # whistling last frame (enter needs a bigger jump than exit
+            # needs to sustain), so a borderline signal doesn't chatter.
+            rms_threshold = noise_floor * (NOISE_EXIT_MULTIPLE if currently_whistling else NOISE_ENTER_MULTIPLE)
+            is_whistle = (rms >= rms_threshold) and (purity >= PURITY_THRESHOLD)
+            currently_whistling = is_whistle
+
+            # Only drift the floor toward the ambient level while NOT
+            # whistling, so an ongoing whistle never gets absorbed into
+            # "the new background level."
+            if not is_whistle:
+                noise_floor = (1 - NOISE_FLOOR_EMA_ALPHA) * noise_floor + NOISE_FLOOR_EMA_ALPHA * rms
+                noise_floor = max(noise_floor, NOISE_FLOOR_MIN)
+
+            # Median-smooth the frequency estimate over the last few
+            # whistle-only frames before classifying, so one noisy frame's
+            # peak can't shift the picked band on its own.
+            if is_whistle:
+                recent_peak_freqs.append(peak_freq)
+                smoothed_freq = float(np.median(recent_peak_freqs))
+            else:
+                recent_peak_freqs.clear()
+                smoothed_freq = peak_freq
+
+            raw_command = classify_frequency(smoothed_freq) if is_whistle else None
 
             now = time.monotonic()
             if is_whistle:
@@ -264,21 +313,18 @@ def audio_thread_fn(device_index, mqtt_client, channel):
                     and raw_command is not None):
                 stable_command = raw_command
 
-            # Fail-safe: revert to this channel's neutral default if nothing
-            # valid has been heard recently -- see the README's answer to
-            # "what if no whistle is detected?" Note the default differs by
-            # channel: throttle fails safe to STOP (stop moving), steer
-            # fails safe to STRAIGHT (stop turning, but don't fight
-            # whatever the throttle channel is doing).
+            # Fail-safe: force STOP if nothing valid has been heard recently
+            # -- see the README's answer to "what if no whistle is detected?"
             if now - last_whistle_time > NO_WHISTLE_TIMEOUT:
-                effective_command = default_command
+                effective_command = cfg.CMD_STOP
             else:
-                effective_command = stable_command or default_command
+                effective_command = stable_command or cfg.CMD_STOP
 
             if effective_command != last_published:
-                mqtt_client.publish(topic, effective_command)
+                mqtt_client.publish(cfg.DRIVE_TOPIC, effective_command)
                 print(f"[whistle] -> {effective_command}  "
-                      f"(peak={peak_freq:.0f}Hz purity={purity:.2f} rms={rms:.3f})")
+                      f"(peak={smoothed_freq:.0f}Hz purity={purity:.2f} rms={rms:.3f} "
+                      f"floor={noise_floor:.3f} threshold={rms_threshold:.3f})")
                 last_published = effective_command
 
             # Scroll this frame's magnitude spectrum (cropped to the display
@@ -292,13 +338,15 @@ def audio_thread_fn(device_index, mqtt_client, channel):
                 state["waveform"] = rolling.copy()
                 state["freqs"] = freqs
                 state["magnitude"] = magnitude
-                state["peak_freq"] = peak_freq
+                state["peak_freq"] = smoothed_freq
                 state["rms"] = rms
                 state["purity"] = purity
                 state["whistle_detected"] = is_whistle
                 state["raw_command"] = raw_command
                 state["spec_history"] = spec_history
                 state["effective_command"] = effective_command
+                state["noise_floor"] = noise_floor
+                state["rms_threshold"] = rms_threshold
     finally:
         stream.stop_stream()
         stream.close()
@@ -311,20 +359,18 @@ def audio_thread_fn(device_index, mqtt_client, channel):
 
 plt.style.use("dark_background")
 
-# The selected channel's band edges/labels/colors, used by both the
-# spectrogram (horizontal bands) and the spectrum panel (vertical bands) --
-# one definition, so the two views can never disagree about which
-# frequency does what. Set by main() before build_plot() is called.
-BAND_EDGES = None
-BAND_LABELS = None
-BAND_COLORS = None
+# Shared by both the spectrogram (horizontal bands) and the spectrum panel
+# (vertical bands) -- one definition, so the two views can never disagree
+# about which frequency does what.
+BAND_EDGES = [0, BAND_STOP_MAX, BAND_LEFT_MAX, BAND_RIGHT_MAX, BAND_FORWARD_MAX, PLOT_MAX_FREQ]
+BAND_LABELS = [cfg.CMD_STOP, cfg.CMD_LEFT, cfg.CMD_RIGHT, cfg.CMD_FORWARD, cfg.CMD_GOAL]
 
 
-def build_plot(channel_name):
+def build_plot():
     fig, (ax_wave, ax_specgram, ax_spec) = plt.subplots(
         3, 1, figsize=(10, 10), gridspec_kw={"height_ratios": [1, 2.2, 1.3]}
     )
-    fig.suptitle(f"Whistle Drive -- {channel_name.upper()} channel", fontsize=14, fontweight="bold")
+    fig.suptitle("Whistle Drive -- Live Audio Monitor", fontsize=14, fontweight="bold")
     fig.subplots_adjust(hspace=0.55, top=0.90, left=0.09, right=0.97, bottom=0.06)
 
     # --- Waveform ---
@@ -388,6 +434,7 @@ def update_plot(_frame, wave_line, specgram_im, spec_line, peak_marker, status_t
         whistle_detected = state["whistle_detected"]
         effective_command = state["effective_command"]
         spec_history = state["spec_history"]
+        rms_threshold = state["rms_threshold"]
 
     wave_line.set_ydata(waveform)
 
@@ -405,7 +452,8 @@ def update_plot(_frame, wave_line, specgram_im, spec_line, peak_marker, status_t
     status_text.set_text(
         f"command: {effective_command:<8}  "
         f"{'WHISTLE' if whistle_detected else 'no whistle':<10}  "
-        f"peak={peak_freq:6.0f} Hz   purity={purity:4.2f}   rms={rms:5.3f}"
+        f"peak={peak_freq:6.0f} Hz   purity={purity:4.2f}   "
+        f"rms={rms:5.3f}   threshold={rms_threshold:5.3f}"
     )
 
     return wave_line, specgram_im, spec_line, peak_marker, status_text
@@ -426,8 +474,6 @@ def list_devices():
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Whistle-controlled driving commands over MQTT")
-    parser.add_argument("--channel", required=True, choices=["steer", "throttle"],
-                        help="Which axis this person/laptop is controlling")
     parser.add_argument("--device", type=int, default=None,
                         help="Input device index (see --list-devices)")
     parser.add_argument("--list-devices", action="store_true",
@@ -436,27 +482,33 @@ def parse_args():
 
 
 def main():
-    global BAND_EDGES, BAND_LABELS, BAND_COLORS, running
-
     args = parse_args()
     if args.list_devices:
         list_devices()
         return
 
-    channel = CHANNELS[args.channel]
-    BAND_EDGES = channel["band_edges"]
-    BAND_LABELS = channel["band_labels"]
-    BAND_COLORS = channel["colors"]
+    if STARTUP_TEST_DRIVE:
+        startup_test_drive()
 
+    global running
     mqtt_client = MQTTClient()
-    mqtt_client.connect()
-    print(f"[{args.channel}] Publishing commands to '{channel['topic']}'")
+    print(f"[whistle] Connecting to MQTT broker ({mqtt_client.broker})...")
+    attempt = 0
+    while True:
+        attempt += 1
+        mqtt_client.connect()
+        if mqtt_client.is_connected():
+            break
+        print(f"[whistle] Still not connected (attempt {attempt}) -- "
+              f"check your network/broker reachability. Retrying...")
+        mqtt_client.disconnect()
+    print(f"[whistle] Connected to MQTT broker ({mqtt_client.broker}).")
+    print(f"Publishing driving commands to '{cfg.DRIVE_TOPIC}'")
 
-    audio_thread = threading.Thread(target=audio_thread_fn,
-                                    args=(args.device, mqtt_client, channel), daemon=True)
+    audio_thread = threading.Thread(target=audio_thread_fn, args=(args.device, mqtt_client), daemon=True)
     audio_thread.start()
 
-    fig, wave_line, specgram_im, spec_line, peak_marker, status_text = build_plot(args.channel)
+    fig, wave_line, specgram_im, spec_line, peak_marker, status_text = build_plot()
     ani = FuncAnimation(fig, update_plot,
                         fargs=(wave_line, specgram_im, spec_line, peak_marker, status_text),
                         interval=80, cache_frame_data=False)
@@ -472,7 +524,7 @@ def main():
     finally:
         running = False
         audio_thread.join(timeout=2)
-        mqtt_client.publish(channel["topic"], channel["default_command"])  # leave in a safe neutral state on exit
+        mqtt_client.publish(cfg.DRIVE_TOPIC, cfg.CMD_STOP)  # leave the robot stopped on exit
         time.sleep(0.2)
         mqtt_client.disconnect()
 
