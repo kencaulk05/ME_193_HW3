@@ -42,6 +42,7 @@ Usage:
     python main_computer.py --list-devices            # find your mic's device index
     python main_computer.py --device 2
     python main_computer.py --role ball --simulate    # no hardware needed, just prints
+    python main_computer.py --role ball --practice    # game live immediately, no referee START needed
 Close the plot window (or Ctrl+C) to quit (motors always stop and
 disconnect cleanly).
 """
@@ -58,7 +59,7 @@ from lelib import doubleMotor, colorSensor
 import config as cfg
 import songs
 from mqttlib import MQTTClient
-from whistle_detector import WhistleDetector
+from whistle_detector import WhistleDetector, NOISE_EXIT_MULTIPLE, PURITY_THRESHOLD
 from whistle_display import WhistleMonitor
 
 SAMPLE_RATE = 44100
@@ -82,6 +83,17 @@ GOAL_MAX_FREQ = 5000
 ANALYSIS_MIN_FREQ = FORWARD_MIN_FREQ
 ANALYSIS_MAX_FREQ = GOAL_MAX_FREQ
 
+# GOAL gets its own faster trigger instead of waiting on the detector's
+# smoothed verdict: it looks at each frame's RAW peak (skipping the median
+# smoothing, which otherwise needs a majority of GOAL frames before it
+# flips -- noticeable lag when sliding up from a FORWARD whistle), and uses
+# the detector's lower "continue" RMS gate rather than its stricter "start"
+# gate, since high-pitched whistles tend to come out quieter. The purity
+# gate still applies, so broadband noise can't sneak through. Fires after
+# this many consecutive qualifying frames (~23 ms each at CHUNK=1024) --
+# raise to 2-3 if you ever see false goals.
+GOAL_CONFIRM_FRAMES = 1
+
 DRIVE_SPEED = 50    # forward speed, 0-100, applied to both wheels
 TURN_BIAS = 30      # added to the left wheel / subtracted from the right
                     # while turning -- bigger = tighter/faster turn
@@ -95,7 +107,7 @@ REMOTE_SIGNAL_TIMEOUT = 2.0
 # just prints live reflection() readings) while a teammate's hand/robot
 # approaches from the front at roughly the distance you want to count as
 # "caught," and set this just above the resting (nobody-nearby) reading.
-PROXIMITY_REFLECTION_THRESHOLD = 60
+PROXIMITY_REFLECTION_THRESHOLD = 5
 
 # The two physical motors are usually mounted mirrored on the chassis --
 # same fix as ME_193_HW3's game_logic.py. Flip whichever side turns out to
@@ -112,6 +124,14 @@ def classify_local(freq):
     if GOAL_MIN_FREQ <= freq <= GOAL_MAX_FREQ:
         return "GOAL"
     return None
+
+
+def is_goal_frame(detector):
+    """Fast, unsmoothed GOAL check on the detector's most recent frame (see
+    GOAL_CONFIRM_FRAMES above for why this bypasses the normal verdict)."""
+    return (GOAL_MIN_FREQ <= detector.raw_peak_freq <= GOAL_MAX_FREQ
+            and detector.purity >= PURITY_THRESHOLD
+            and detector.rms >= detector.noise_floor * NOISE_EXIT_MULTIPLE)
 
 
 class Car:
@@ -245,6 +265,8 @@ def parse_args():
                          help="Run without hardware; just print what would happen.")
     parser.add_argument("--calibrate", action="store_true",
                          help="Ball role only: just print live reflection() readings, no driving/game logic.")
+    parser.add_argument("--practice", action="store_true",
+                         help="Treat the game as live from the start instead of waiting for the referee's START.")
     return parser.parse_args()
 
 
@@ -300,8 +322,10 @@ def main():
     lock = threading.Lock()
     remote_turning = False
     last_remote_message_time = 0.0  # 0 = "never received" -> treated as stale/not-turning
-    game_active = False
+    game_active = args.practice
     game_over = False
+    if args.practice:
+        print("[game] PRACTICE mode: game is live without waiting for START.")
 
     def on_turn_message(topic, payload):
         nonlocal remote_turning, last_remote_message_time
@@ -338,8 +362,10 @@ def main():
         print("[game] Scored! Whistle signaled a goal.")
         with lock:
             game_over = True
-        car.stop()
+        # Publish before stopping the car so the goalie hears about it
+        # without waiting on the BLE round-trip.
         mqtt_client.publish(cfg.GAME_TOPIC, cfg.MSG_BALL_SCORED)
+        car.stop()
         songs.play_success_song()
 
     mqtt_client = connect_mqtt()
@@ -362,6 +388,8 @@ def main():
 
     def audio_loop():
         last_left, last_right = None, None
+        goal_streak = 0
+        warned_not_started = False
         p = pyaudio.PyAudio()
         stream = p.open(format=pyaudio.paFloat32, channels=1, rate=SAMPLE_RATE,
                          input=True, input_device_index=args.device, frames_per_buffer=CHUNK)
@@ -375,6 +403,9 @@ def main():
 
                 is_whistle, freq = detector.update(chunk)
                 local_class = classify_local(freq) if is_whistle else None
+                goal_streak = goal_streak + 1 if is_goal_frame(detector) else 0
+                if goal_streak >= GOAL_CONFIRM_FRAMES:
+                    local_class = "GOAL"
                 local_forward = (local_class == "FORWARD")
 
                 with lock:
@@ -397,6 +428,10 @@ def main():
                 if args.role == "ball" and local_class == "GOAL" and active and not over:
                     handle_score(mqtt_client)
                     over = True
+                elif args.role == "ball" and local_class == "GOAL" and not active and not warned_not_started:
+                    print("[game] GOAL whistle heard, but no START received yet -- ignored. "
+                          "Use --practice to test without the referee.")
+                    warned_not_started = True
 
                 # Once tagged/scored, stay stopped/non-responsive for the
                 # rest of the round rather than keep driving.
@@ -407,7 +442,8 @@ def main():
                 left, right = mix(local_forward, turning)
                 status_label = (f"[{args.role.upper()}] {local_class or 'STOP'}/"
                                  f"{'TURN' if turning else 'straight'}"
-                                 f"{' (GAME OVER)' if over else ''}")
+                                 f"{' (GAME OVER)' if over else ''}"
+                                 f"{' (WAITING FOR START)' if not active else ''}")
                 monitor.push(detector, status_label=status_label,
                              status_color="#22c55e" if local_forward else "#888888")
 
