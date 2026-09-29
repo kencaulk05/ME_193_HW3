@@ -38,7 +38,7 @@ CHUNK = 1024
 # intentionally independent from main_computer.py's own
 # ANALYSIS_MIN_FREQ/MAX_FREQ -- the two can be tuned to different ranges.
 ANALYSIS_MIN_FREQ = 2000
-ANALYSIS_MAX_FREQ = 3000
+ANALYSIS_MAX_FREQ = 2500
 
 
 def list_devices():
